@@ -1,0 +1,921 @@
+#!/usr/bin/env python3
+"""xdnatop — High-freq TUI for AMD GPU + XDNA NPU with per-engine bars."""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import fcntl
+import os
+import struct
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from rich.align import Align
+from rich.box import ROUNDED
+from rich.console import Group
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.style import Style
+from rich.table import Table
+from rich.text import Text
+
+GPU_SYS = Path("/sys/class/drm/card0/device")
+HWMAN = next(GPU_SYS.glob("hwmon/hwmon*"), None)
+GPU_METRICS = GPU_SYS / "gpu_metrics"
+ACCEL_SYS = Path("/sys/class/accel/accel0/device")
+
+C_RED = "#ed174a"
+C_ORANGE = "#ff6b35"
+C_GOLD = "#f7c948"
+C_CYAN = "#00d4ff"
+C_MAG = "#b44aeb"
+C_GREEN = "#00e676"
+C_DIM = "#6b7280"
+C_WHITE = "#f0f0f0"
+C_BG = "#0d1117"
+C_BLUE = "#3b82f6"
+C_TEAL = "#14b8a6"
+
+S = lambda c: Style(color=c)
+BS = lambda c: Style(bold=True, color=c)
+
+
+@dataclass
+class GpuEng:
+    gfx: float = 0.0
+    media: float = 0.0
+    vram_used_mb: float = 0.0
+    vram_total_mb: float = 0.0
+    temp_edge: float = 0.0
+    temp_hotspot: float = 0.0
+    temp_vram: float = 0.0
+    power_w: float = 0.0
+    sclk_mhz: float = 0.0
+    name: str = ""
+    cu_count: int = 0
+    ipu_tiles: list[float] = field(default_factory=lambda: [0.0] * 8)
+    ipu_power_mw: float = 0.0
+    ipu_clk_mhz: float = 0.0
+    ipu_reads_mbs: float = 0.0
+    ipu_writes_mbs: float = 0.0
+    dram_reads_mbs: float = 0.0
+    dram_writes_mbs: float = 0.0
+    soc_temp: float = 0.0
+    gfx_clk_mhz: float = 0.0
+    apu_power_w: float = 0.0
+    grbm: dict = field(default_factory=dict)
+    grbm2: dict = field(default_factory=dict)
+
+
+@dataclass
+class SysInfo:
+    cpu_temp: float = 0.0
+    cpu_freq: float = 0.0
+    load_1: float = 0.0
+    load_5: float = 0.0
+    load_15: float = 0.0
+    mem_total_gb: float = 0.0
+    mem_used_gb: float = 0.0
+    gtt_used_mb: float = 0.0
+    gtt_total_mb: float = 0.0
+    fan_rpm: tuple = (0.0, 0.0, 0.0)
+
+
+@dataclass
+class AllData:
+    gpu: GpuEng = field(default_factory=GpuEng)
+    sys: SysInfo = field(default_factory=SysInfo)
+    npu_fw: str = ""
+    freq_hz: float = 0.0
+    timestamp: float = 0.0
+
+
+# ─── GRBM / GRBM2 perf-counter sampler (real MMIO registers, like amdgpu_top) ─
+#
+# amdgpu_top reads GRBM_STATUS / GRBM2_STATUS2 via the AMDGPU_INFO_READ_MMR_REG
+# ioctl, samples each register 100x at ~1-10ms apart, and counts how many of
+# those 100 samples had each status bit set — that count *is* the percentage.
+# Bit-index tables below are taken verbatim from amdgpu_top's
+# libamdgpu_top/src/stat/mod.rs for the GFX10_3/GFX10 chip-class tables, which
+# is what Strix Halo (gfx1150, CHIP_CLASS::GFX11_5) resolves to.
+
+DRM_DEVICE = "/dev/dri/card0"
+AMDGPU_INFO_READ_MMR_REG = 0x15
+DRM_COMMAND_BASE = 0x40
+DRM_AMDGPU_INFO = 0x05
+GRBM_OFFSET = 0x2004
+GRBM2_OFFSET = 0x2002
+
+GRBM_BITS = [
+    ("Graphics Pipe", 31),
+    ("Texture Pipe", 14),
+    ("Shader Export", 20),
+    ("Shader Processor Interpolator", 22),
+    ("Primitive Assembly", 25),
+    ("Depth Block", 26),
+    ("Color Block", 30),
+    ("Geometry Engine", 21),
+]
+
+GRBM2_BITS = [
+    ("RunList Controller", 26),
+    ("Texture Cache per Pipe", 27),
+    ("Unified Translation Cache L2", 15),
+    ("Efficiency Arbiter", 16),
+    ("Render Backend Mem Interface", 17),
+    ("SDMA", 21),
+    ("Command Processor - Fetcher", 28),
+    ("Command Processor - Compute", 29),
+    ("Command Processor - Graphics", 30),
+]
+
+
+class _DrmAmdgpuInfo(ctypes.Structure):
+    _fields_ = [
+        ("return_pointer", ctypes.c_uint64),
+        ("return_size", ctypes.c_uint32),
+        ("query", ctypes.c_uint32),
+        ("dword_offset", ctypes.c_uint32),
+        ("count", ctypes.c_uint32),
+        ("instance", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+def _ioc_iow(nr: int, size: int) -> int:
+    return (1 << 30) | (size << 16) | (ord("d") << 8) | nr
+
+
+_IOCTL_AMDGPU_INFO = _ioc_iow(DRM_COMMAND_BASE + DRM_AMDGPU_INFO, ctypes.sizeof(_DrmAmdgpuInfo))
+
+
+class GrbmSampler:
+    """Background thread that continuously polls GRBM/GRBM2 status registers
+    and accumulates per-bit set-counts, like amdgpu_top's PerfCounter."""
+
+    SAMPLE_DELAY = 0.001  # 1ms between samples, matches amdgpu_top's high-freq mode
+
+    def __init__(self):
+        self._fd = None
+        self._buf = ctypes.c_uint32(0)
+        self._lock = threading.Lock()
+        self._counts = {"grbm": [0] * 32, "grbm2": [0] * 32}
+        self._total = {"grbm": 0, "grbm2": 0}
+        self._ok = False
+        try:
+            self._fd = os.open(DRM_DEVICE, os.O_RDWR)
+            self._read_mmr(GRBM_OFFSET)
+            self._read_mmr(GRBM2_OFFSET)
+            self._ok = True
+        except OSError:
+            self._ok = False
+        if self._ok:
+            t = threading.Thread(target=self._run, daemon=True)
+            t.start()
+
+    def _read_mmr(self, offset: int) -> int:
+        self._buf.value = 0xFFFFFFFF
+        req = _DrmAmdgpuInfo(
+            return_pointer=ctypes.addressof(self._buf),
+            return_size=4,
+            query=AMDGPU_INFO_READ_MMR_REG,
+            dword_offset=offset,
+            count=1,
+            instance=0,
+            flags=0,
+        )
+        fcntl.ioctl(self._fd, _IOCTL_AMDGPU_INFO, req, False)
+        return self._buf.value
+
+    def _run(self):
+        while True:
+            try:
+                g = self._read_mmr(GRBM_OFFSET)
+                g2 = self._read_mmr(GRBM2_OFFSET)
+            except OSError:
+                time.sleep(0.5)
+                continue
+            with self._lock:
+                counts_g = self._counts["grbm"]
+                counts_g2 = self._counts["grbm2"]
+                for i in range(32):
+                    if g & (1 << i):
+                        counts_g[i] += 1
+                    if g2 & (1 << i):
+                        counts_g2[i] += 1
+                self._total["grbm"] += 1
+                self._total["grbm2"] += 1
+            time.sleep(self.SAMPLE_DELAY)
+
+    def snapshot_pct(self) -> tuple[dict, dict]:
+        """Returns (grbm_pct, grbm2_pct) by name, then resets accumulators."""
+        if not self._ok:
+            return {}, {}
+        with self._lock:
+            total_g = max(self._total["grbm"], 1)
+            total_g2 = max(self._total["grbm2"], 1)
+            counts_g = self._counts["grbm"]
+            counts_g2 = self._counts["grbm2"]
+            grbm_pct = {name: counts_g[bit] / total_g * 100.0 for name, bit in GRBM_BITS}
+            grbm2_pct = {name: counts_g2[bit] / total_g2 * 100.0 for name, bit in GRBM2_BITS}
+            self._counts = {"grbm": [0] * 32, "grbm2": [0] * 32}
+            self._total = {"grbm": 0, "grbm2": 0}
+        return grbm_pct, grbm2_pct
+
+
+_GRBM_SAMPLER: GrbmSampler | None = None
+
+
+def _grbm_sampler() -> GrbmSampler:
+    global _GRBM_SAMPLER
+    if _GRBM_SAMPLER is None:
+        _GRBM_SAMPLER = GrbmSampler()
+    return _GRBM_SAMPLER
+
+
+_GPU_CACHE: GpuEng = GpuEng()
+
+# ─── gpu_metrics binary parser ───────────────────────────────────────────────
+
+
+def _parse_gpu_metrics() -> dict:
+    try:
+        data = GPU_METRICS.read_bytes()
+    except (FileNotFoundError, OSError):
+        return {}
+    if len(data) < 4:
+        return {}
+    hdr = struct.unpack_from("<HBb", data, 0)
+    fmt_rev = hdr[1]
+
+    r = {}
+    if fmt_rev == 3:
+        if len(data) >= 46 + 16:
+            raw = struct.unpack_from("<8H", data, 46)
+            r["ipu_tiles"] = [float(v) for v in raw]
+        if len(data) >= 44 + 2:
+            vcn_raw = struct.unpack_from("<H", data, 44)[0]
+            r["vcn_act"] = float(vcn_raw) if vcn_raw != 0xFFFF else 0.0
+        if len(data) >= 42 + 2:
+            r["gfx_act"] = float(struct.unpack_from("<H", data, 42)[0])
+        if len(data) >= 4 + 2:
+            v = struct.unpack_from("<H", data, 4)[0]
+            r["temp_gfx"] = v / 100.0 if v != 0xFFFF else 0.0
+        if len(data) >= 6 + 2:
+            v = struct.unpack_from("<H", data, 6)[0]
+            r["temp_soc"] = v / 100.0 if v != 0xFFFF else 0.0
+        if len(data) >= 94 + 2:
+            r["dram_r"] = float(struct.unpack_from("<H", data, 94)[0])
+            r["dram_w"] = float(struct.unpack_from("<H", data, 96)[0])
+        if len(data) >= 98 + 2:
+            r["ipu_r"] = float(struct.unpack_from("<H", data, 98)[0])
+            r["ipu_w"] = float(struct.unpack_from("<H", data, 100)[0])
+        # u64 system_clock_counter at 104 (8-byte aligned, 2B pad @ 102)
+        if len(data) >= 112 + 4:
+            r["sock_pow"] = struct.unpack_from("<I", data, 112)[0] / 1000.0
+        if len(data) >= 116 + 2:
+            r["ipu_pow"] = float(struct.unpack_from("<H", data, 116)[0])
+        if len(data) >= 120 + 4:
+            v = struct.unpack_from("<I", data, 120)[0]
+            r["apu_pow"] = v / 1000.0 if v != 0xFFFFFFFF else 0.0
+        if len(data) >= 124 + 4:
+            v = struct.unpack_from("<I", data, 124)[0]
+            r["gfx_pow"] = v / 1000.0 if v != 0xFFFFFFFF else 0.0
+        if len(data) >= 174 + 2:
+            v = struct.unpack_from("<H", data, 174)[0]
+            r["gfx_clk"] = float(v) if v != 0xFFFF else 0.0
+        if len(data) >= 180 + 2:
+            v = struct.unpack_from("<H", data, 180)[0]
+            r["ipu_clk"] = float(v) if v != 0xFFFF else 0.0
+        if len(data) >= 188 + 2:
+            v = struct.unpack_from("<H", data, 188)[0]
+            r["mpipu_freq"] = float(v) if v != 0xFFFF else 0.0
+    return r
+
+
+# ─── GPU readers ─────────────────────────────────────────────────────────────
+
+
+def _read(p: Path) -> str:
+    try:
+        return p.read_text().strip()
+    except (FileNotFoundError, OSError):
+        return "0"
+
+
+def _rdint(p: Path) -> int:
+    try:
+        return int(_read(p))
+    except ValueError:
+        return 0
+
+
+def read_gpu() -> GpuEng:
+    d = GpuEng()
+    d.gfx = float(_read(GPU_SYS / "gpu_busy_percent"))
+    d.media = float(_read(GPU_SYS / "vcn_busy_percent"))
+
+    if HWMAN:
+        d.power_w = _rdint(HWMAN / "power1_average") / 1_000_000
+        d.sclk_mhz = _rdint(HWMAN / "freq1_input") / 1_000_000
+        d.temp_edge = _rdint(HWMAN / "temp1_input") / 1000
+
+    gm = _parse_gpu_metrics()
+    if gm:
+        d.ipu_tiles = gm.get("ipu_tiles", [0.0] * 8)
+        if "gfx_act" in gm:
+            d.gfx = gm["gfx_act"]
+        if "vcn_act" in gm:
+            d.media = gm["vcn_act"]
+        d.ipu_power_mw = gm.get("ipu_pow", 0.0)
+        d.ipu_clk_mhz = gm.get("ipu_clk", 0.0)
+        d.ipu_reads_mbs = gm.get("ipu_r", 0.0)
+        d.ipu_writes_mbs = gm.get("ipu_w", 0.0)
+        d.dram_reads_mbs = gm.get("dram_r", 0.0)
+        d.dram_writes_mbs = gm.get("dram_w", 0.0)
+        d.soc_temp = gm.get("temp_soc", 0.0)
+        d.apu_power_w = gm.get("apu_pow", 0.0)
+        if d.power_w == 0.0:
+            d.power_w = gm.get("sock_pow", 0.0)
+        if d.sclk_mhz == 0.0:
+            d.sclk_mhz = gm.get("gfx_clk", 0.0)
+        d.gfx_clk_mhz = gm.get("gfx_clk", 0.0)
+
+    d.grbm, d.grbm2 = _grbm_sampler().snapshot_pct()
+
+    try:
+        if not _GPU_CACHE.name:
+            import amdsmi
+            amdsmi.amdsmi_init()
+            h = amdsmi.amdsmi_get_processor_handles()[0]
+            info = amdsmi.amdsmi_get_gpu_asic_info(h)
+            n = info.get("market_name", "Radeon Graphics")
+            _GPU_CACHE.name = n.removeprefix("AMD ").removeprefix("amd ")
+            _GPU_CACHE.cu_count = int(info.get("num_compute_units", 0))
+            try:
+                vu = amdsmi.amdsmi_get_gpu_vram_usage(h)
+                _GPU_CACHE.vram_total_mb = float(vu.get("vram_total", 512))
+            except Exception:
+                pass
+        d.name = _GPU_CACHE.name
+        d.cu_count = _GPU_CACHE.cu_count
+        d.vram_total_mb = _GPU_CACHE.vram_total_mb
+        import amdsmi
+        handles = amdsmi.amdsmi_get_processor_handles()
+        vu = amdsmi.amdsmi_get_gpu_vram_usage(handles[0])
+        d.vram_used_mb = float(vu.get("vram_used", 0))
+        try:
+            d.temp_hotspot = float(amdsmi.amdsmi_get_temp_metric(
+                handles[0], amdsmi.AmdSmiTemperatureType.HOTSPOT, amdsmi.AmdSmiTemperatureMetric.CURRENT))
+        except Exception:
+            pass
+        try:
+            d.temp_vram = float(amdsmi.amdsmi_get_temp_metric(
+                handles[0], amdsmi.AmdSmiTemperatureType.VRAM, amdsmi.AmdSmiTemperatureMetric.CURRENT))
+        except Exception:
+            pass
+    except Exception:
+        d.name = _GPU_CACHE.name or "Radeon Graphics"
+        d.cu_count = _GPU_CACHE.cu_count
+        d.vram_total_mb = _GPU_CACHE.vram_total_mb
+    return d
+
+
+# ─── Sys readers ─────────────────────────────────────────────────────────────
+
+
+def read_sys() -> SysInfo:
+    s = SysInfo()
+    for hwmon in Path("/sys/class/hwmon").iterdir():
+        try:
+            name = (hwmon / "name").read_text().strip()
+            if name == "k10temp":
+                t = _rdint(hwmon / "temp1_input")
+                if t:
+                    s.cpu_temp = t / 1000
+                    break
+        except OSError:
+            continue
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if "MHz" in line:
+                    s.cpu_freq = float(line.split(":")[1].strip())
+                    break
+    except OSError:
+        pass
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+            s.load_1, s.load_5, s.load_15 = float(parts[0]), float(parts[1]), float(parts[2])
+    except OSError:
+        pass
+    meminfo = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":", 1)
+                meminfo[k.strip()] = int(v.strip().split()[0])
+        total_kb = meminfo.get("MemTotal", 0)
+        avail_kb = meminfo.get("MemAvailable", 0)
+        s.mem_total_gb = total_kb / 1_000_000
+        s.mem_used_gb = (total_kb - avail_kb) / 1_000_000
+    except OSError:
+        pass
+    s.gtt_total_mb = _rdint(GPU_SYS / "mem_info_gtt_total") / 1_000_000
+    s.gtt_used_mb = _rdint(GPU_SYS / "mem_info_gtt_used") / 1_000_000
+    for hwmon in Path("/sys/class/hwmon").iterdir():
+        try:
+            name = (hwmon / "name").read_text().strip()
+        except OSError:
+            continue
+        if name == "su_axb35":
+            f = lambda i: float(_rdint(hwmon / f"fan{i}_input")) if (hwmon / f"fan{i}_input").exists() else 0.0
+            s.fan_rpm = (f(1), f(2), f(3))
+            break
+    return s
+
+
+def collect() -> AllData:
+    d = AllData(
+        gpu=read_gpu(),
+        sys=read_sys(),
+        npu_fw=_read(ACCEL_SYS / "fw_version"),
+        timestamp=time.time(),
+    )
+    return d
+
+
+# ─── TUI (real btop visual language) ─────────────────────────────────────────
+#
+# From direct inspection of btop screenshots:
+#  - Background: terminal default (near-black). No navy field.
+#  - Borders: thin single-line hairline drawn DIM GRAY/WHITE — never a per-panel
+#    accent. Panel titles embedded in the top border, each title TEXT colored
+#    semantically per panel (cpu=red, mem=green, net=cyan, ...).
+#  - Bars: SOLID block fill (█). Color is SEMANTIC: green=low load → red=high
+#    load for activity/busy bars; red=used / dim-gray=free for resource bars.
+#    The unfilled remainder is ALWAYS solid dim-gray █ blocks, never a track char.
+#  - Per-item rows: label + colored micro braille graph + % in the load color.
+#  - History graphs: braille-dot scatter colored by current value, not a flat
+#    single-hue filled mountain.
+#  - All labels/values: BOLD BRIGHT WHITE, always (never dimmed by activity).
+
+from collections import deque
+
+from rich.box import Box
+
+# Shared palette.
+C_TEXT = "#ffffff"       # bold bright white for ALL labels/values, always
+C_GRAY = "#4a4f5a"       # dim gray — bar remainder + hairline borders
+
+# Semantic hues (btop-accurate).
+SEM_RED = "#e5484d"      # used / hot / high load
+SEM_GREEN = "#46d369"    # free / cool / low load
+SEM_BLUE = "#4f9dff"     # temperature readouts
+SEM_CYAN = "#34d6e0"     # directional "down" / reads
+SEM_MAG = "#d76fd7"      # directional "up" / writes
+SEM_YELLOW = "#e8c34a"
+SEM_BORDER = C_GRAY
+
+# Per-panel title colors (semantic-per-panel, not one global accent).
+TITLE_ENGINE = SEM_RED
+TITLE_PULSE = SEM_GREEN
+TITLE_MEM = SEM_CYAN
+TITLE_NPU = SEM_MAG
+TITLE_SENSORS = SEM_YELLOW
+TITLE_HEADER = SEM_BLUE
+
+# Two btop-accurate semantic palettes; `t` toggles. Both keep the same
+# meaning (low→high), they just shift the cool/warm endpoints.
+THEMES = [
+    {"name": "load",  "lo": SEM_GREEN, "hi": SEM_RED},
+    {"name": "cool",  "lo": SEM_CYAN,  "hi": SEM_MAG},
+]
+
+_THEME: dict = THEMES[0]
+
+
+def _hex_rgb(h: str) -> tuple[int, int, int]:
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def _lerp_color(c_lo: str, c_hi: str, frac: float) -> str:
+    frac = max(0.0, min(1.0, frac))
+    a = _hex_rgb(c_lo)
+    b = _hex_rgb(c_hi)
+    r = tuple(round(a[i] + (b[i] - a[i]) * frac) for i in range(3))
+    return f"#{r[0]:02x}{r[1]:02x}{r[2]:02x}"
+
+
+def _load_color(pct: float) -> str:
+    """Green (low) → red (high), via the active theme's lo/hi endpoints."""
+    return _lerp_color(_THEME["lo"], _THEME["hi"], pct / 100.0)
+
+
+# ── EMA smoothing store, keyed by metric name (stable, fixed-order rows). ──────
+_EMA_ALPHA = 0.3
+_EMA: dict[str, float] = {}
+
+
+def _smooth(key: str, value: float) -> float:
+    prev = _EMA.get(key)
+    if prev is None:
+        _EMA[key] = value
+        return value
+    cur = prev + _EMA_ALPHA * (value - prev)
+    _EMA[key] = cur
+    return cur
+
+
+HISTORY_LEN = 60
+_HISTORY: dict = {
+    "gfx": deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN),
+    "ipu": deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN),
+    "cpu": deque([0.0] * HISTORY_LEN, maxlen=HISTORY_LEN),
+}
+
+# Per-engine short history for inline micro-graphs (keyed by engine name).
+_ENG_HIST: dict = {}
+
+def _push_history(d: "AllData") -> None:
+    _HISTORY["gfx"].append(_EMA.get("gfx", d.gpu.gfx))
+    ipu_avg = sum(d.gpu.ipu_tiles) / max(len(d.gpu.ipu_tiles), 1)
+    _HISTORY["ipu"].append(_EMA.get("ipu", ipu_avg))
+    cpu = min(d.sys.load_1 / max(os.cpu_count() or 1, 1) * 100.0, 100.0)
+    _HISTORY["cpu"].append(_smooth("cpu", cpu))
+
+
+# Braille columns — each cell stacks 4 vertical dots (1..4 set), so a row of
+# them reads as a fine dotted scatter graph rather than a blocky mountain.
+_BRAILLE_COL = [0x00, 0x40, 0x44, 0x46, 0x47]  # 0..4 dots filled bottom-up
+
+
+def _braille_cell(level: int) -> str:
+    return chr(0x2800 + _BRAILLE_COL[max(0, min(4, level))])
+
+
+def _scatter(values, lo: float = 0.0, hi: float = 100.0) -> Text:
+    """Fine braille-dot scatter history, each column colored by its own value
+    (green low → red high). Not a flat single-hue silhouette."""
+    span = max(hi - lo, 1e-6)
+    out = Text()
+    for v in values:
+        frac = (max(lo, min(hi, v)) - lo) / span
+        level = min(int(frac * 4 + 0.5), 4)
+        out.append(_braille_cell(level), Style(color=_load_color(v)))
+    return out
+
+
+def _micro(values, lo: float = 0.0, hi: float = 100.0) -> Text:
+    """Compact inline braille micro-graph colored by the latest value."""
+    color = _load_color(values[-1] if len(values) else 0.0)
+    span = max(hi - lo, 1e-6)
+    out = Text()
+    sty = Style(color=color)
+    for v in values:
+        frac = (max(lo, min(hi, v)) - lo) / span
+        out.append(_braille_cell(min(int(frac * 4 + 0.5), 4)), sty)
+    return out
+
+
+def _bar(pct: float, width: int = 24, color: str | None = None,
+         show_pct: bool = True, load: bool = False) -> Text:
+    """Solid █ block fill (btop-style). Filled cells in a SEMANTIC color; the
+    unfilled remainder is solid dim-gray █ blocks (never a track char). With
+    load=True the fill color ramps green→red by %. The % label is ALWAYS bold
+    bright white."""
+    pct_c = max(0.0, min(100.0, pct))
+    if load:
+        color = _load_color(pct_c)
+    color = color or SEM_RED
+    filled = int(round(pct_c / 100 * width))
+    out = Text()
+    out.append("█" * filled, Style(color=color))
+    out.append("█" * (width - filled), Style(color=C_GRAY))
+    if show_pct:
+        out.append(f" {pct_c:4.0f}%", Style(color=C_TEXT, bold=True))
+    return out
+
+
+# Hairline rounded frame — btop-style thin single line.
+LUX_BOX = Box(
+    "╭──╮\n"
+    "│ ││\n"
+    "├──┤\n"
+    "│ ││\n"
+    "├──┤\n"
+    "├──┤\n"
+    "│ ││\n"
+    "╰──╯\n"
+)
+
+
+def _panel(body, title: str, title_color: str, subtitle: str | None = None) -> Panel:
+    """Hairline border in constant dim gray; the title TEXT carries the
+    per-panel semantic color (btop-style)."""
+    return Panel(
+        body,
+        title=Text(f" {title} ", style=Style(color=title_color, bold=True)),
+        subtitle=Text(f" {subtitle} ", style=Style(color=C_GRAY)) if subtitle else None,
+        title_align="left",
+        subtitle_align="right",
+        border_style=Style(color=SEM_BORDER),
+        box=LUX_BOX,
+        padding=(1, 2),
+    )
+
+
+def _engine_panel(gpu: GpuEng) -> Panel:
+    """GRBM + GRBM2 residency. Fixed row order (never sorted). Each row: label +
+    colored braille micro-graph + load-colored block bar + % in the load color."""
+    if not gpu.grbm and not gpu.grbm2:
+        body = Align.center(Group(
+            Text("engine counters unavailable", style=Style(color=C_TEXT, bold=True)),
+            Text("need read/write on /dev/dri/card0", style=Style(color=C_GRAY)),
+        ), vertical="middle")
+        return _panel(body, "engine activity", TITLE_ENGINE)
+
+    combined = list(gpu.grbm.items()) + list(gpu.grbm2.items())
+    label_w = max(len(n) for n, _ in combined)
+
+    tbl = Table.grid(padding=(0, 2))
+    tbl.add_column(justify="right")
+    tbl.add_column()
+    tbl.add_column()
+    for name, raw in combined:
+        pct = _smooth(f"eng:{name}", raw)
+        hist = _ENG_HIST.setdefault(name, deque([0.0] * 12, maxlen=12))
+        hist.append(pct)
+        tbl.add_row(
+            Text(name.rjust(label_w), style=Style(color=C_TEXT, bold=True)),
+            _micro(hist),
+            _bar(pct, width=22, load=True),
+        )
+
+    return _panel(Align.center(tbl, vertical="middle"), "engine activity",
+                  TITLE_ENGINE, "GRBM · GRBM2")
+
+
+def _pulse_panel(d: AllData) -> Panel:
+    gpu, sys = d.gpu, d.sys
+    gfx = _smooth("gfx", gpu.gfx)
+    ipu = _smooth("ipu", sum(gpu.ipu_tiles) / max(len(gpu.ipu_tiles), 1))
+    cpu = _HISTORY["cpu"][-1]
+
+    tbl = Table.grid(padding=(0, 2))
+    tbl.add_column(justify="right")
+    tbl.add_column()
+
+    def block(label, val, hist):
+        tbl.add_row(Text(label, style=Style(color=C_TEXT, bold=True)),
+                    _bar(val, width=24, load=True))
+        tbl.add_row(Text(""), _scatter(hist))
+
+    block("GFX", gfx, _HISTORY["gfx"])
+    tbl.add_row(Text(""), Text(""))
+    block("IPU", ipu, _HISTORY["ipu"])
+    tbl.add_row(Text(""), Text(""))
+    block("CPU", cpu, _HISTORY["cpu"])
+
+    return _panel(tbl, "pulse", TITLE_PULSE)
+
+
+def _mem_panel(gpu: GpuEng, sys: SysInfo) -> Panel:
+    """Resource bars (btop mem panel): label + right-aligned value line, then a
+    full-width solid bar — red used portion, dim-gray free remainder."""
+    rows = []
+
+    def metric(label, pct, detail):
+        line = Table.grid(expand=True)
+        line.add_column(justify="left")
+        line.add_column(justify="right")
+        line.add_row(
+            Text(label, style=Style(color=C_TEXT, bold=True)),
+            Text(detail, style=Style(color=C_TEXT, bold=True)),
+        )
+        rows.append(line)
+        rows.append(_bar(pct, width=40, color=SEM_RED, show_pct=False))
+        rows.append(Text(""))
+
+    vpct = (gpu.vram_used_mb / max(gpu.vram_total_mb, 1)) * 100
+    gpct = (sys.gtt_used_mb / max(sys.gtt_total_mb, 1)) * 100
+    metric("VRAM", vpct, f"{gpu.vram_used_mb:,.0f} / {gpu.vram_total_mb:,.0f} MiB")
+    metric("GTT", gpct, f"{sys.gtt_used_mb:,.0f} / {sys.gtt_total_mb:,.0f} MiB")
+    if sys.mem_total_gb:
+        mpct = sys.mem_used_gb / max(sys.mem_total_gb, 1) * 100
+        metric("RAM", mpct, f"{sys.mem_used_gb:.1f} / {sys.mem_total_gb:.1f} GB")
+
+    return _panel(Group(*rows), "memory", TITLE_MEM)
+
+
+def _npu_panel(d: AllData) -> Panel:
+    gpu = d.gpu
+    tbl = Table.grid(padding=(0, 2))
+    tbl.add_column(justify="right")
+    tbl.add_column()
+    for idx, raw in enumerate(gpu.ipu_tiles):
+        v = _smooth(f"tile:{idx}", raw)
+        tbl.add_row(
+            Text(f"Tile {idx}", style=Style(color=C_TEXT, bold=True)),
+            _bar(v, width=18, load=True),
+        )
+    info = []
+    if gpu.ipu_clk_mhz:
+        info.append(f"{gpu.ipu_clk_mhz:.0f} MHz")
+    if gpu.ipu_power_mw:
+        info.append(f"{gpu.ipu_power_mw:.0f} mW")
+    if gpu.ipu_reads_mbs or gpu.ipu_writes_mbs:
+        info.append(f"R {gpu.ipu_reads_mbs:.0f} · W {gpu.ipu_writes_mbs:.0f} MB/s")
+    body = [Align.center(tbl, vertical="middle")]
+    if info:
+        body.append(Text(""))
+        body.append(Align.center(Text("   ".join(info), style=Style(color=C_TEXT, bold=True))))
+    return _panel(Group(*body), "xdna npu", TITLE_NPU)
+
+
+def _sensors_panel(gpu: GpuEng, sys: SysInfo) -> Panel:
+    """Label/value grid. Values bold bright white; temperatures colored blue
+    (btop temp readouts are blue)."""
+    tbl = Table.grid(padding=(0, 3))
+    for _ in range(4):
+        tbl.add_column()
+
+    def cell(label: str, value: str, color: str = C_TEXT) -> tuple[Text, Text]:
+        return (
+            Text(label, style=Style(color=C_TEXT, bold=True)),
+            Text(value, style=Style(color=color, bold=True)),
+        )
+
+    rows = [
+        cell("GFX Clk", f"{gpu.gfx_clk_mhz or gpu.sclk_mhz:.0f} MHz"),
+        cell("GPU Pwr", f"{gpu.power_w:.1f} W"),
+        cell("Edge", f"{gpu.temp_edge:.0f}°C" if gpu.temp_edge else "N/A", SEM_BLUE),
+        cell("SoC", f"{gpu.soc_temp:.0f}°C" if gpu.soc_temp else "N/A", SEM_BLUE),
+        cell("CPU Clk", f"{sys.cpu_freq:.0f} MHz" if sys.cpu_freq else "N/A"),
+        cell("CPU Temp", f"{sys.cpu_temp:.0f}°C" if sys.cpu_temp else "N/A", SEM_BLUE),
+        cell("Load", f"{sys.load_1:.1f} · {sys.load_5:.1f} · {sys.load_15:.1f}"),
+        cell("Fan", " · ".join(f"{r:.0f}" for r in sys.fan_rpm if r > 0) + " RPM" if any(sys.fan_rpm) else "N/A"),
+    ]
+    for i in range(0, len(rows), 2):
+        a, b = rows[i], rows[i + 1]
+        tbl.add_row(a[0], a[1], b[0], b[1])
+
+    return _panel(tbl, "sensors", TITLE_SENSORS)
+
+
+def _layout() -> Layout:
+    ly = Layout()
+    ly.split(
+        Layout(name="header", size=5),
+        Layout(name="main", ratio=1),
+    )
+    ly["main"].split_row(
+        Layout(name="engine", ratio=3),
+        Layout(name="side", ratio=2),
+    )
+    ly["side"].split(
+        Layout(name="pulse", size=13),
+        Layout(name="mem", ratio=2),
+        Layout(name="npu", ratio=3),
+    )
+    ly["engine"].split(
+        Layout(name="engine_top", ratio=1),
+        Layout(name="sensors", size=9),
+    )
+    return ly
+
+
+def _header(d: AllData, fps: int = 60) -> Panel:
+    gpu = d.gpu
+    name = gpu.name or "Radeon Graphics"
+    title = Text.assemble(
+        Text("xdnatop", style=Style(bold=True, color=TITLE_HEADER)),
+        Text("  luxe", style=Style(color=C_TEXT, bold=True)),
+    )
+    sub = Text.assemble(
+        Text(name, style=Style(color=C_TEXT, bold=True)),
+        Text(f"   ·   {gpu.cu_count} CU" if gpu.cu_count else "", style=Style(color=C_TEXT, bold=True)),
+        Text(f"   ·   {_THEME['name']}", style=Style(color=TITLE_HEADER)),
+    )
+    keys = Text.assemble(
+        Text("f", style=Style(bold=True, color=TITLE_HEADER)), Text(f" {fps}fps", style=Style(color=C_TEXT)),
+        Text("    t", style=Style(bold=True, color=TITLE_HEADER)), Text(" theme", style=Style(color=C_TEXT)),
+        Text("    q", style=Style(bold=True, color=TITLE_HEADER)), Text(" quit", style=Style(color=C_TEXT)),
+        Text("      " + time.strftime("%H:%M:%S"), style=Style(color=C_TEXT)),
+    )
+    grid = Table.grid(expand=True)
+    grid.add_column(justify="left")
+    grid.add_column(justify="right")
+    grid.add_row(title, keys)
+    grid.add_row(sub, Text(""))
+    return Panel(grid, border_style=Style(color=SEM_BORDER), box=LUX_BOX, padding=(0, 2))
+
+
+FPS_LEVELS = [5, 10, 20, 30, 60]
+
+
+def render(d: AllData, fps: int = 60, theme: dict | None = None) -> Layout:
+    global _THEME
+    if theme:
+        _THEME = theme
+    _push_history(d)
+    ly = _layout()
+    ly["header"].update(_header(d, fps))
+    ly["engine_top"].update(_engine_panel(d.gpu))
+    ly["sensors"].update(_sensors_panel(d.gpu, d.sys))
+    ly["pulse"].update(_pulse_panel(d))
+    ly["mem"].update(_mem_panel(d.gpu, d.sys))
+    ly["npu"].update(_npu_panel(d))
+    return ly
+
+
+# ─── Watch mode ──────────────────────────────────────────────────────────────
+
+
+def _watch(high_freq: bool = False):
+    import signal
+    import sys
+
+    signal.signal(signal.SIGINT, lambda s, f: exit(0))
+    interval = 0.1 if high_freq else 0.5
+    while True:
+        d = collect()
+        gpu_s = f"GFX:{d.gpu.gfx:.0f}% VRAM:{d.gpu.vram_used_mb:.0f}MB"
+        ipu_avg = sum(d.gpu.ipu_tiles) / max(len(d.gpu.ipu_tiles), 1)
+        ipu_s = f"IPU:{ipu_avg:.0f}%"
+        fan_s = f" fan:{d.sys.fan_rpm[0]:.0f}" if d.sys.fan_rpm[0] else ""
+        line = (f"\r{gpu_s:<32} {ipu_s:<14} |"
+                f" CPU:{d.sys.cpu_temp:.0f}°C load:{d.sys.load_1:.1f}{fan_s} | {time.strftime('%H:%M:%S')}")
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        time.sleep(interval)
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+
+def main():
+    parser = argparse.ArgumentParser(description="High-freq TUI for AMD GPU + XDNA NPU")
+    parser.add_argument("-w", "--watch", action="store_true", help="Simple watch mode (no TUI)")
+    parser.add_argument("-f", "--freq", action="store_true", help="High-frequency mode (20 fps)")
+    parser.add_argument("-F", "--ultra", action="store_true", help="Ultra high-frequency mode (60 fps)")
+    args = parser.parse_args()
+
+    import signal
+    signal.signal(signal.SIGINT, lambda s, f: exit(0))
+
+    if args.watch:
+        _watch(high_freq=args.freq or args.ultra)
+        return
+
+    import select
+    import sys
+    import termios
+    import tty
+
+    fps_idx = FPS_LEVELS.index(60) if args.ultra else (FPS_LEVELS.index(20) if args.freq else FPS_LEVELS.index(60))
+    theme_idx = 0
+
+    stdin_fd = sys.stdin.fileno()
+    raw_mode = False
+    try:
+        old_term = termios.tcgetattr(stdin_fd)
+        tty.setcbreak(stdin_fd)
+        raw_mode = True
+    except (termios.error, OSError):
+        old_term = None
+
+    try:
+        fps = FPS_LEVELS[fps_idx]
+        with Live(render(collect(), fps, THEMES[theme_idx]), screen=True, refresh_per_second=fps) as live:
+            while True:
+                if raw_mode:
+                    while select.select([sys.stdin], [], [], 0)[0]:
+                        ch = sys.stdin.read(1)
+                        if ch in ("q", "Q"):
+                            return
+                        if ch in ("f", "F"):
+                            fps_idx = (fps_idx + 1) % len(FPS_LEVELS)
+                            fps = FPS_LEVELS[fps_idx]
+                            live.refresh_per_second = fps
+                        if ch in ("t", "T"):
+                            theme_idx = (theme_idx + 1) % len(THEMES)
+                d = collect()
+                d.freq_hz = fps
+                live.update(render(d, fps, THEMES[theme_idx]))
+                time.sleep(1.0 / fps)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if raw_mode and old_term is not None:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term)
+
+
+if __name__ == "__main__":
+    main()
